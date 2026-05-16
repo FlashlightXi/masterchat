@@ -15,6 +15,7 @@ export type ErrorCode =
   | "membersOnly" // No permission (members-only)
   | "unarchived" // Live stream recording is not available
   | "denied" // Access denied (429)
+  | "disconnected" // Chat connection was lost or stalled
   | "invalid"; // Invalid request
 
 export interface MembersOnlyErrorData {
@@ -28,6 +29,13 @@ export interface MembersOnlyErrorData {
     isMembersOnly?: boolean;
     metadata?: VideoObject;
   };
+}
+
+export interface AccessDeniedErrorData {
+  videoId?: string;
+  source?: string;
+  status?: number;
+  code?: string;
 }
 
 export class MasterchatError<T = any> extends Error {
@@ -86,8 +94,8 @@ export class NoStreamRecordingError extends MasterchatError {
 }
 
 export class AccessDeniedError extends MasterchatError {
-  constructor(msg: string) {
-    super("denied", msg);
+  constructor(msg: string, data?: AccessDeniedErrorData) {
+    super("denied", msg, data);
     Object.setPrototypeOf(this, AccessDeniedError.prototype);
   }
 }
@@ -96,6 +104,13 @@ export class InvalidArgumentError extends MasterchatError {
   constructor(msg: string) {
     super("invalid", msg);
     Object.setPrototypeOf(this, InvalidArgumentError.prototype);
+  }
+}
+
+export class DisconnectedError extends MasterchatError {
+  constructor(msg: string) {
+    super("disconnected", msg);
+    Object.setPrototypeOf(this, DisconnectedError.prototype);
   }
 }
 

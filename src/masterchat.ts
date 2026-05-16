@@ -11,6 +11,7 @@ import {
   AbortError,
   AccessDeniedError,
   DisabledChatError,
+  DisconnectedError,
   EndReason,
   InvalidArgumentError,
   MasterchatError,
@@ -74,6 +75,49 @@ export type RetryOptions = {
   retryInterval?: number;
 };
 
+const DEFAULT_AXIOS_TIMEOUT_MS = 4000;
+const DEFAULT_FETCH_RETRY = 3;
+const DEFAULT_FETCH_RETRY_INTERVAL_MS = 2000;
+const DEFAULT_ITERATE_TIMEOUT_SEC = 60;
+const MIN_CONTINUATION_DELAY_MS = 500;
+
+export type IterateDebugStage =
+  | "fetch:start"
+  | "fetch:success"
+  | "fetch:error"
+  | "delay:start"
+  | "delay:success"
+  | "delay:error"
+  | "disconnect";
+
+export interface IterateDebugEvent {
+  stage: IterateDebugStage;
+  videoId: string;
+  isLive?: boolean;
+  iteration: number;
+  token?: string | FetchChatOptions;
+  continuation?: string;
+  timeoutMs?: number;
+  elapsedMs?: number;
+  actions?: number;
+  reason?: IterateDisconnectReason;
+  error?: unknown;
+}
+
+export type IterateDebugOption = boolean | ((event: IterateDebugEvent) => void);
+
+export type IterateDisconnectReason =
+  | "access-denied"
+  | "fetch-error"
+  | "stalled"
+  | "delay-error";
+
+export interface IterateDisconnectEvent extends IterateDebugEvent {
+  stage: "disconnect";
+  reason: IterateDisconnectReason;
+  error: unknown;
+}
+
 export interface IterateChatOptions extends FetchChatOptions {
   /**
    * ignore first response fetched by reload token
@@ -84,6 +128,23 @@ export interface IterateChatOptions extends FetchChatOptions {
 
   /** pass previously fetched token to resume chat fetching */
   continuation?: string;
+
+  /**
+   * Emit detailed iterate diagnostics to console.debug (true) or a custom callback.
+   */
+  debug?: IterateDebugOption;
+
+  /**
+   * Called once when iterate detects a broken/stalled connection or unrecoverable fetch error.
+   */
+  onDisconnect?: (event: IterateDisconnectEvent) => void | Promise<void>;
+
+  /**
+   * Maximum seconds iterate may wait for a fetch or continuation delay.
+   * Set 0 to disable this watchdog.
+   * @default 120
+   */
+  timeoutSec?: number;
 }
 
 export interface FetchChatOptions {
@@ -100,6 +161,7 @@ export interface Events {
   chats: (chats: AddChatItemAction[], mc: Masterchat) => void;
   chat: (chat: AddChatItemAction, mc: Masterchat) => void;
   end: (reason: EndReason) => void;
+  disconnect: (event: IterateDisconnectEvent) => void;
   error: (error: MasterchatError | Error) => void;
 }
 
@@ -263,6 +325,88 @@ export class Masterchat extends EventEmitter {
 
   private log(label: string, ...obj: any) {
     debugLog(`${label}(${this.videoId}):`, ...obj);
+  }
+
+  private emitIterateDebug(
+    debug: IterateDebugOption | undefined,
+    event: IterateDebugEvent
+  ) {
+    if (!debug) return;
+
+    if (typeof debug === "function") {
+      try {
+        debug(event);
+      } catch (err) {
+        this.log("iterate", "debug callback failed", err);
+      }
+      return;
+    }
+
+    console.debug("[masterchat]", event.stage, event);
+  }
+
+  private async emitDisconnect(
+    onDisconnect: IterateChatOptions["onDisconnect"],
+    event: IterateDisconnectEvent
+  ) {
+    this.emit("disconnect", event);
+    try {
+      await onDisconnect?.(event);
+    } catch (err) {
+      this.log("iterate", "disconnect callback failed", err);
+    }
+  }
+
+  private withIterateWatchdog<T>(
+    promise: Promise<T>,
+    timeoutSec: number,
+    onTimeout: () => DisconnectedError
+  ): Promise<T> {
+    if (timeoutSec <= 0) {
+      return promise;
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(onTimeout());
+      }, timeoutSec * 1000);
+
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      );
+    });
+  }
+
+  private isAccessDeniedAxiosError(err: unknown): err is AxiosError {
+    const axiosError = err as AxiosError | undefined;
+    return (
+      !!axiosError?.isAxiosError &&
+      (axiosError.response?.status === 429 || axiosError.code === "429")
+    );
+  }
+
+  private createAccessDeniedError(source: string, err?: unknown) {
+    const axiosError = err as AxiosError | undefined;
+    return new AccessDeniedError(
+      [
+        `Access denied by YouTube while ${source} (HTTP 429).`,
+        "YouTube may be rate-limiting this client or showing a CAPTCHA page.",
+        "Try opening the video in a browser and solving the CAPTCHA, pass valid cookies/credentials, reduce request frequency, or change network/IP.",
+      ].join(" "),
+      {
+        videoId: this.videoId,
+        source,
+        status: axiosError?.response?.status,
+        code: axiosError?.code,
+      }
+    );
   }
 
   private cvPair() {
@@ -438,7 +582,7 @@ export class Masterchat extends EventEmitter {
     this.axiosInstance =
       axiosInstance ??
       axios.create({
-        timeout: 4000,
+        timeout: DEFAULT_AXIOS_TIMEOUT_MS,
       });
 
     this.setCredentials(credentials);
@@ -466,10 +610,8 @@ export class Masterchat extends EventEmitter {
       return parseMetadataFromWatch(html);
     } catch (err) {
       // Check ban status
-      if (err instanceof AxiosError) {
-        if (err.response?.status === 429 || err.code === "429") {
-          throw new AccessDeniedError("Rate limit exceeded: " + this.videoId);
-        }
+      if (this.isAccessDeniedAxiosError(err)) {
+        throw this.createAccessDeniedError("fetching watch metadata", err);
       }
       throw err;
     }
@@ -480,8 +622,10 @@ export class Masterchat extends EventEmitter {
       const html = await this.get<string>(`/embed/${id}`);
       return parseMetadataFromEmbed(html);
     } catch (err) {
-      if ((err as AxiosError).code === "429")
-        throw new AccessDeniedError("Rate limit exceeded: " + id);
+      if (this.isAccessDeniedAxiosError(err)) {
+        throw this.createAccessDeniedError("fetching embed metadata", err);
+      }
+      throw err;
     }
   }
 
@@ -645,6 +789,9 @@ export class Masterchat extends EventEmitter {
     topChat = false,
     ignoreFirstResponse = false,
     continuation,
+    debug,
+    onDisconnect,
+    timeoutSec = DEFAULT_ITERATE_TIMEOUT_SEC,
   }: IterateChatOptions = {}): AsyncGenerator<ChatResponse> {
     const signal = this.listenerAbortion.signal;
 
@@ -655,11 +802,78 @@ export class Masterchat extends EventEmitter {
     let token: any = continuation ? continuation : { top: topChat };
 
     let treatedFirstResponse = false;
+    let iteration = 0;
 
     // continuously fetch chat fragments
     while (true) {
-      const res = await this.fetch(token);
       const startMs = Date.now();
+      let res: ChatResponse;
+
+      try {
+        this.emitIterateDebug(debug, {
+          stage: "fetch:start",
+          videoId: this.videoId,
+          isLive: this.isLive,
+          iteration,
+          token,
+        });
+
+        res = await this.withIterateWatchdog(
+          this.fetch(token),
+          timeoutSec,
+          () =>
+            new DisconnectedError(
+              `Live chat fetch timed out after ${timeoutSec} seconds`
+            )
+        );
+
+        this.emitIterateDebug(debug, {
+          stage: "fetch:success",
+          videoId: this.videoId,
+          isLive: this.isLive,
+          iteration,
+          token,
+          elapsedMs: Date.now() - startMs,
+          actions: res.actions.length,
+          continuation: res.continuation?.token,
+          timeoutMs: res.continuation?.timeoutMs,
+        });
+      } catch (error) {
+        this.emitIterateDebug(debug, {
+          stage: "fetch:error",
+          videoId: this.videoId,
+          isLive: this.isLive,
+          iteration,
+          token,
+          elapsedMs: Date.now() - startMs,
+          error,
+        });
+
+        if (error instanceof AbortError) {
+          throw error;
+        }
+
+        const reason: IterateDisconnectReason =
+          error instanceof AccessDeniedError
+            ? "access-denied"
+            : error instanceof DisconnectedError
+            ? "stalled"
+            : "fetch-error";
+        const event: IterateDisconnectEvent = {
+          stage: "disconnect",
+          videoId: this.videoId,
+          isLive: this.isLive,
+          iteration,
+          token,
+          elapsedMs: Date.now() - startMs,
+          reason,
+          error,
+        };
+
+        this.emitIterateDebug(debug, event);
+        await this.emitDisconnect(onDisconnect, event);
+        throw error;
+      }
 
       // handle chats
       if (!(ignoreFirstResponse && !treatedFirstResponse)) {
@@ -681,10 +895,69 @@ export class Masterchat extends EventEmitter {
       if (this.isLive ?? true) {
         const driftMs = Date.now() - startMs;
         const timeoutMs = continuation.timeoutMs - driftMs;
-        if (timeoutMs > 500) {
-          await delay(timeoutMs, signal);
+        if (timeoutMs > MIN_CONTINUATION_DELAY_MS) {
+          try {
+            this.emitIterateDebug(debug, {
+              stage: "delay:start",
+              videoId: this.videoId,
+              isLive: this.isLive,
+              iteration,
+              token,
+              timeoutMs,
+            });
+
+            await this.withIterateWatchdog(
+              delay(timeoutMs, signal),
+              timeoutSec,
+              () =>
+                new DisconnectedError(
+                  `Live chat continuation wait timed out after ${timeoutSec} seconds`
+                )
+            );
+
+            this.emitIterateDebug(debug, {
+              stage: "delay:success",
+              videoId: this.videoId,
+              isLive: this.isLive,
+              iteration,
+              token,
+              timeoutMs,
+            });
+          } catch (error) {
+            this.emitIterateDebug(debug, {
+              stage: "delay:error",
+              videoId: this.videoId,
+              isLive: this.isLive,
+              iteration,
+              token,
+              timeoutMs,
+              error,
+            });
+
+            if (error instanceof AbortError) {
+              throw error;
+            }
+
+            const event: IterateDisconnectEvent = {
+              stage: "disconnect",
+              videoId: this.videoId,
+              isLive: this.isLive,
+              iteration,
+              token,
+              timeoutMs,
+              reason:
+                error instanceof DisconnectedError ? "stalled" : "delay-error",
+              error,
+            };
+
+            this.emitIterateDebug(debug, event);
+            await this.emitDisconnect(onDisconnect, event);
+            throw error;
+          }
         }
       }
+
+      iteration += 1;
     }
   }
 
@@ -703,8 +976,8 @@ export class Masterchat extends EventEmitter {
     const topChat = options.topChat ?? false;
     const target = this.cvPair();
 
-    let retryRemaining = 5;
-    const retryInterval = 1000;
+    let retryRemaining = DEFAULT_FETCH_RETRY;
+    const retryInterval = DEFAULT_FETCH_RETRY_INTERVAL_MS;
 
     let requestUrl: string = "";
     let requestBody;
@@ -756,6 +1029,10 @@ export class Masterchat extends EventEmitter {
               message: string;
             };
           }>;
+
+          if (this.isAccessDeniedAxiosError(err)) {
+            throw this.createAccessDeniedError("fetching live chat", err);
+          }
 
           // handle early timeout
           if (
