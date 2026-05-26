@@ -178,6 +178,8 @@ export interface Masterchat {
 }
 
 export interface MasterchatOptions {
+  clientVersion?: string;
+
   /**
    * you can grab Credentials using `extra/credential-fetcher`
    */
@@ -224,6 +226,7 @@ export class Masterchat extends EventEmitter {
   private listener: ChatListener | null = null;
   private listenerAbortion: AbortController = new AbortController();
 
+  protected clientVersion?: string;
   protected credentials?: Credentials;
   protected cookies?: Record<string, string>;
 
@@ -428,7 +431,7 @@ export class Masterchat extends EventEmitter {
     const endpoint = Constants.EP_GICM + "&" + query.toString();
     const response = await this.postWithRetry<YTGetItemContextMenuResponse>(
       endpoint,
-      withContext(),
+      withContext({}, { clientVersion: this.clientVersion }),
       {
         retry: 2,
       }
@@ -529,9 +532,10 @@ export class Masterchat extends EventEmitter {
     let json: YTActionResponse;
     if (actionInfo.isPost) {
       json = await this.post<YTActionResponse>(url, {
-        body: withContext({
-          params: actionInfo.params,
-        }),
+        body: withContext(
+          { params: actionInfo.params },
+          { clientVersion: this.clientVersion }
+        ),
       });
     } else {
       json = await this.get(url);
@@ -547,7 +551,14 @@ export class Masterchat extends EventEmitter {
    */
 
   /**
-   * Useful when you don't know channelId or isLive status
+   * Useful when you don't know `channelId` or `isLive` status
+   *
+   * If you already have `channelId`
+   * try to reduce this call
+   * as it will throw `AccessDeniedError`
+   * as you increase amount of `Masterchat` instance
+   *
+   * Directly use `new Masterchat(videoId, channelId)` instead
    */
   public static async init(
     videoIdOrUrl: string,
@@ -571,7 +582,13 @@ export class Masterchat extends EventEmitter {
   constructor(
     videoId: string,
     channelId: string,
-    { mode, credentials, cookies, axiosInstance }: MasterchatOptions = {}
+    {
+      mode,
+      credentials,
+      cookies,
+      clientVersion,
+      axiosInstance,
+    }: MasterchatOptions = {}
   ) {
     super();
     this.videoId = videoId;
@@ -579,6 +596,7 @@ export class Masterchat extends EventEmitter {
     this.isLive =
       mode === "live" ? true : mode === "replay" ? false : undefined;
 
+    this.clientVersion = clientVersion;
     this.axiosInstance =
       axiosInstance ??
       axios.create({
@@ -1002,9 +1020,10 @@ export class Masterchat extends EventEmitter {
 
       const continuation = getContinuationValue(isLive);
 
-      requestBody = withContext({
-        continuation,
-      });
+      requestBody = withContext(
+        { continuation },
+        { clientVersion: self.clientVersion }
+      );
     }
 
     applyNewLiveStatus(this.isLive ?? true);
@@ -1217,16 +1236,19 @@ export class Masterchat extends EventEmitter {
   ): Promise<YTLiveChatTextMessageRenderer> {
     const params = sendMessageParams(this.cvPair());
 
-    const body = withContext({
-      richMessage: {
-        textSegments: [
-          {
-            text: message,
-          },
-        ],
+    const body = withContext(
+      {
+        richMessage: {
+          textSegments: [
+            {
+              text: message,
+            },
+          ],
+        },
+        params,
       },
-      params,
-    });
+      { clientVersion: this.clientVersion }
+    );
 
     const res = await this.postWithRetry<YTActionResponse>(
       Constants.EP_SM,
@@ -1256,9 +1278,7 @@ export class Masterchat extends EventEmitter {
     const params = pinParams(chatId, this.cvPair());
     const res = await this.post<YTActionResponse>(
       Constants.EP_LCA,
-      withContext({
-        params,
-      })
+      withContext({ params }, { clientVersion: this.clientVersion })
     );
     if (!res.success) {
       throw new Error(`Failed to pin chat: ` + JSON.stringify(res));
@@ -1271,9 +1291,7 @@ export class Masterchat extends EventEmitter {
 
     const res = await this.post<YTActionResponse>(
       Constants.EP_LCA,
-      withContext({
-        params,
-      })
+      withContext({ params }, { clientVersion: this.clientVersion })
     );
 
     if (!res.success) {
@@ -1292,9 +1310,7 @@ export class Masterchat extends EventEmitter {
 
     const res = await this.post<YTActionResponse>(
       Constants.EP_MOD,
-      withContext({
-        params,
-      })
+      withContext({ params }, { clientVersion: this.clientVersion })
     );
 
     if (!res.success) {
@@ -1328,9 +1344,7 @@ export class Masterchat extends EventEmitter {
 
     const res = await this.post<YTActionResponse>(
       Constants.EP_MOD,
-      withContext({
-        params,
-      })
+      withContext({ params }, { clientVersion: this.clientVersion })
     );
 
     if (!res.success) {
@@ -1346,9 +1360,7 @@ export class Masterchat extends EventEmitter {
 
     const res = await this.post<YTActionResponse>(
       Constants.EP_MOD,
-      withContext({
-        params,
-      })
+      withContext({ params }, { clientVersion: this.clientVersion })
     );
 
     if (!res.success) {
@@ -1363,9 +1375,7 @@ export class Masterchat extends EventEmitter {
 
     const res = await this.post<YTActionResponse>(
       Constants.EP_MOD,
-      withContext({
-        params,
-      })
+      withContext({ params }, { clientVersion: this.clientVersion })
     );
 
     if (!res.success) {
@@ -1397,9 +1407,7 @@ export class Masterchat extends EventEmitter {
     const params = addModeratorParams(channelId, this.cvPair());
     const res = await this.post<YTActionResponse>(
       Constants.EP_MU,
-      withContext({
-        params,
-      })
+      withContext({ params }, { clientVersion: this.clientVersion })
     );
     if (!res.success) {
       throw new Error(`Failed to perform action: ` + JSON.stringify(res));
@@ -1411,9 +1419,7 @@ export class Masterchat extends EventEmitter {
     const params = addModeratorParams(channelId, this.cvPair(), true);
     const res = await this.post<YTActionResponse>(
       Constants.EP_MU,
-      withContext({
-        params,
-      })
+      withContext({ params }, { clientVersion: this.clientVersion })
     );
     if (!res.success) {
       throw new Error(`Failed to perform action: ` + JSON.stringify(res));
@@ -1441,9 +1447,10 @@ export class Masterchat extends EventEmitter {
       continuation = csc(this.videoId, continuation);
     }
 
-    const body = withContext({
-      continuation,
-    });
+    const body = withContext(
+      { continuation },
+      { clientVersion: this.clientVersion }
+    );
 
     const payload = await this.post<any>(Constants.EP_NXT, body);
 
