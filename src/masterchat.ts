@@ -79,6 +79,7 @@ const DEFAULT_AXIOS_TIMEOUT_MS = 4000;
 const DEFAULT_FETCH_RETRY = 3;
 const DEFAULT_FETCH_RETRY_INTERVAL_MS = 2000;
 const DEFAULT_ITERATE_TIMEOUT_SEC = 60;
+const DEFAULT_RECONNECT_RETRY_INTERVAL_MS = 2000;
 const MIN_CONTINUATION_DELAY_MS = 500;
 
 export type IterateDebugStage =
@@ -116,6 +117,23 @@ export interface IterateDisconnectEvent extends IterateDebugEvent {
   stage: "disconnect";
   reason: IterateDisconnectReason;
   error: unknown;
+  willReconnect: boolean;
+  reconnectAttempt?: number;
+  retryAfterMs?: number;
+}
+
+export interface IterateReconnectOptions {
+  /**
+   * Maximum consecutive reconnect attempts before the original error is thrown.
+   * @default Infinity
+   */
+  retry?: number;
+
+  /**
+   * Milliseconds to wait before retrying with the latest continuation token.
+   * @default 2000
+   */
+  retryInterval?: number;
 }
 
 export interface IterateChatOptions extends FetchChatOptions {
@@ -135,14 +153,22 @@ export interface IterateChatOptions extends FetchChatOptions {
   debug?: IterateDebugOption;
 
   /**
-   * Called once when iterate detects a broken/stalled connection or unrecoverable fetch error.
+   * Called when iterate detects a broken/stalled connection or fetch error.
    */
   onDisconnect?: (event: IterateDisconnectEvent) => void | Promise<void>;
 
   /**
+   * Reconnect after recoverable fetch failures or watchdog timeouts.
+   * `true` retries until stopped; pass options to limit consecutive retries.
+   * Reconnects resume from the latest continuation token and may yield duplicate chats.
+   * @default false
+   */
+  reconnect?: boolean | IterateReconnectOptions;
+
+  /**
    * Maximum seconds iterate may wait for a fetch or continuation delay.
    * Set 0 to disable this watchdog.
-   * @default 120
+   * @default 60
    */
   timeoutSec?: number;
 }
@@ -409,6 +435,12 @@ export class Masterchat extends EventEmitter {
         status: axiosError?.response?.status,
         code: axiosError?.code,
       }
+    );
+  }
+
+  private isReconnectableIterateError(error: unknown) {
+    return (
+      error instanceof DisconnectedError || !(error instanceof MasterchatError)
     );
   }
 
@@ -809,6 +841,7 @@ export class Masterchat extends EventEmitter {
     continuation,
     debug,
     onDisconnect,
+    reconnect = false,
     timeoutSec = DEFAULT_ITERATE_TIMEOUT_SEC,
   }: IterateChatOptions = {}): AsyncGenerator<ChatResponse> {
     const signal = this.listenerAbortion.signal;
@@ -821,6 +854,40 @@ export class Masterchat extends EventEmitter {
 
     let treatedFirstResponse = false;
     let iteration = 0;
+    let reconnectAttempt = 0;
+    const reconnectOptions =
+      typeof reconnect === "object" ? reconnect : reconnect ? {} : undefined;
+    const reconnectRetry =
+      reconnectOptions?.retry === undefined
+        ? Infinity
+        : Math.max(0, reconnectOptions.retry);
+    const reconnectRetryInterval = Math.max(
+      0,
+      reconnectOptions?.retryInterval ?? DEFAULT_RECONNECT_RETRY_INTERVAL_MS
+    );
+
+    const handleDisconnect = async (event: IterateDisconnectEvent) => {
+      const willReconnect =
+        reconnectOptions !== undefined &&
+        this.isReconnectableIterateError(event.error) &&
+        reconnectAttempt < reconnectRetry;
+
+      event.willReconnect = willReconnect;
+      if (willReconnect) {
+        reconnectAttempt += 1;
+        event.reconnectAttempt = reconnectAttempt;
+        event.retryAfterMs = reconnectRetryInterval;
+      }
+
+      this.emitIterateDebug(debug, event);
+      await this.emitDisconnect(onDisconnect, event);
+
+      if (!willReconnect) {
+        throw event.error;
+      }
+
+      await delay(reconnectRetryInterval, signal);
+    };
 
     // continuously fetch chat fragments
     while (true) {
@@ -886,12 +953,14 @@ export class Masterchat extends EventEmitter {
           elapsedMs: Date.now() - startMs,
           reason,
           error,
+          willReconnect: false,
         };
 
-        this.emitIterateDebug(debug, event);
-        await this.emitDisconnect(onDisconnect, event);
-        throw error;
+        await handleDisconnect(event);
+        continue;
       }
+
+      reconnectAttempt = 0;
 
       // handle chats
       if (!(ignoreFirstResponse && !treatedFirstResponse)) {
@@ -966,11 +1035,11 @@ export class Masterchat extends EventEmitter {
               reason:
                 error instanceof DisconnectedError ? "stalled" : "delay-error",
               error,
+              willReconnect: false,
             };
 
-            this.emitIterateDebug(debug, event);
-            await this.emitDisconnect(onDisconnect, event);
-            throw error;
+            await handleDisconnect(event);
+            continue;
           }
         }
       }

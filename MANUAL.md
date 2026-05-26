@@ -66,6 +66,33 @@ mc.on("end", () => {
 mc.listen();
 ```
 
+To keep listening across transient connection failures, enable reconnection:
+
+```js
+mc.on("disconnect", ({ willReconnect, reconnectAttempt }) => {
+  console.log("Disconnected", { willReconnect, reconnectAttempt });
+});
+
+mc.listen({
+  reconnect: true, // retry until mc.stop() is called
+});
+```
+
+To stop after a number of consecutive failed reconnects, provide options:
+
+```js
+mc.listen({
+  reconnect: {
+    retry: 5,
+    retryInterval: 2000,
+  },
+});
+```
+
+Reconnection resumes from the latest continuation token. Since the service may
+send overlapping chat items after recovery, consumers should de-duplicate by
+chat id when reconnection is enabled.
+
 #### Async Iterator API
 
 ```js
